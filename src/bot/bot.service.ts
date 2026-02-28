@@ -1,18 +1,18 @@
-import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
+import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import { Telegraf, Markup } from 'telegraf';
 import { io, Socket } from 'socket.io-client';
 import { RedisService } from '../redis/redis.service';
 import { UserSettings, QueueState, OnlineStats, DEFAULT_SETTINGS } from './bot.types';
 
-const ADMIN_ID = 389569299;
+const ADMIN_ID: number[] = [389569299, 366409812];
 const SOCKET_URL = 'https://api.dotaclassic.ru';
 
 @Injectable()
 export class BotService implements OnModuleInit, OnModuleDestroy {
   private bot: Telegraf;
   private socket: Socket;
-  private readonly logger = new Logger(BotService.name);
 
   private queues: Record<number, number> = { 1: 0, 8: 0 };
   private lastPushCount: Record<number, number> = { 1: 0, 8: 0 };
@@ -20,6 +20,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private config: ConfigService,
     private redis: RedisService,
+    @InjectPinoLogger(BotService.name) private readonly logger: PinoLogger,
   ) {
     this.bot = new Telegraf(this.config.getOrThrow('TG_KEY'));
   }
@@ -27,8 +28,14 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     this.setupCommands();
     this.setupSocket();
+
+    await this.bot.telegram.setMyCommands([
+      { command: 'start', description: 'Начать работу с ботом' },
+      { command: 'notifications', description: 'Настройки уведомлений' },
+    ]);
+
     await this.bot.launch();
-    this.logger.log('Bot started');
+    this.logger.info('Bot started');
   }
 
   async onModuleDestroy() {
@@ -37,18 +44,21 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   }
 
   private setupCommands() {
-    this.bot.start(async (ctx) => {
-      const user = await this.redis.getOrCreateUser(ctx.chat.id, ctx.from.username || 'n/a');
-      await ctx.reply('⚙️ *Настройки уведомлений*\nВыбери, какие уведомления хочешь получать:', {
-        parse_mode: 'Markdown',
-        ...this.getKeyboard(user.settings),
-      });
-    });
+    this.bot.start((ctx) => this.handleNotifications(ctx, 'start'));
+    this.bot.command('notifications', (ctx) => this.handleNotifications(ctx, 'notifications'));
 
     this.bot.action(/toggle_(normal|highroom|manual)/, async (ctx) => {
       const type = ctx.match[1] as keyof UserSettings;
       const chatId = ctx.chat?.id;
       if (!chatId) return;
+
+      this.logger.info({
+        event: 'action',
+        action: `toggle_${type}`,
+        userId: ctx.from.id,
+        username: ctx.from.username,
+        chatId,
+      });
 
       const settings = await this.redis.toggleSetting(chatId, type);
       if (settings) {
@@ -58,20 +68,33 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.bot.on('text', async (ctx) => {
-      const text = ctx.message.text.toLowerCase();
-      if ((text === 'го' || text === '/го') && ctx.from.id === ADMIN_ID) {
+      const text = ctx.message.text;
+
+      this.logger.info({
+        event: 'message',
+        text,
+        userId: ctx.from.id,
+        username: ctx.from.username,
+        chatId: ctx.chat.id,
+      });
+
+      const lowerText = text.toLowerCase();
+      if ((lowerText === 'го' || lowerText === '/го') && ADMIN_ID.includes(ctx.from.id)) {
         try {
           const res = await fetch(`${SOCKET_URL}/v1/stats/online`);
           const data = (await res.json()) as OnlineStats;
           const msg = [
             `🚀 *DotaClassic: Пора заходить!*`,
-            `👤 Онлайн: ${data.sessions || 0}`,
+            `👤 Играет: ${data.inGame || 0}`,
             `⚔️ Обычная: ${this.queues[1] || 0}`,
             `🏆 Highroom: ${this.queues[8] || 0}`,
           ].join('\n');
           await this.broadcast(msg, 'manual');
           await ctx.reply('✅ Рассылка выполнена.');
-        } catch {
+
+          this.logger.info({ event: 'broadcast', type: 'manual', triggeredBy: ctx.from.id });
+        } catch (err) {
+          this.logger.error({ event: 'broadcast_error', error: err });
           await ctx.reply('Ошибка API.');
         }
       }
@@ -93,6 +116,8 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         const type: keyof UserSettings = mode === 1 ? 'normal' : 'highroom';
         const name = mode === 1 ? 'Обычная 5х5' : 'Highroom 5x5';
         await this.broadcast(`🔥 *Почти собрались!* \nВ поиске (${name}) уже *${count}/10* игроков.`, type);
+
+        this.logger.info({ event: 'broadcast', type, mode, count });
       }
 
       if (count < 5) this.lastPushCount[mode] = 0;
@@ -103,12 +128,32 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     const users = await this.redis.getAllUsers();
     const keyboard = Markup.inlineKeyboard([[Markup.button.url('🔗 Залететь в поиск', 'https://dotaclassic.ru')]]);
 
+    let sent = 0;
     for (const [id, user] of Object.entries(users)) {
       const settings = user.settings || DEFAULT_SETTINGS;
       if (settings[type]) {
         this.bot.telegram.sendMessage(id, text, { parse_mode: 'Markdown', ...keyboard }).catch(() => {});
+        sent++;
       }
     }
+
+    this.logger.info({ event: 'broadcast_complete', type, recipients: sent });
+  }
+
+  private async handleNotifications(ctx: { chat: { id: number }; from: { id: number; username?: string }; reply: Function }, command: string) {
+    this.logger.info({
+      event: 'command',
+      command,
+      userId: ctx.from.id,
+      username: ctx.from.username,
+      chatId: ctx.chat.id,
+    });
+
+    const user = await this.redis.getOrCreateUser(ctx.chat.id, ctx.from.username || 'n/a');
+    await ctx.reply('⚙️ *Настройки уведомлений*\nВыбери, какие уведомления хочешь получать:', {
+      parse_mode: 'Markdown',
+      ...this.getKeyboard(user.settings),
+    });
   }
 
   private getKeyboard(settings?: UserSettings) {

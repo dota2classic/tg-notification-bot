@@ -16,6 +16,7 @@ export interface QueueState {
 
 export interface OnlineStats {
   sessions: number;
+  inGame: number;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
