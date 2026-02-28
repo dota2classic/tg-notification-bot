@@ -78,9 +78,19 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
           this.logger.warn({ event: 'toggle_no_user', chatId, type });
           await ctx.answerCbQuery('Ошибка: пользователь не найден');
         }
-      } catch (err) {
-        this.logger.error({ event: 'toggle_error', chatId, type, error: err });
-        await ctx.answerCbQuery('Произошла ошибка').catch(() => {});
+      } catch (err: unknown) {
+        const isMessageNotModified =
+          err instanceof Error &&
+          'response' in err &&
+          (err as { response?: { description?: string } }).response?.description?.includes('message is not modified');
+
+        if (isMessageNotModified) {
+          this.logger.debug({ event: 'toggle_no_change', chatId, type });
+          await ctx.answerCbQuery('Настройка сохранена');
+        } else {
+          this.logger.error({ event: 'toggle_error', chatId, type, error: err });
+          await ctx.answerCbQuery('Произошла ошибка').catch(() => {});
+        }
       }
     });
 
