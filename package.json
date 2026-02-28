@@ -5,7 +5,9 @@
   "scripts": {
     "build": "nest build",
     "start": "node dist/main.js",
-    "start:dev": "nest start --watch"
+    "start:dev": "nest start --watch",
+    "start:redis": "USE_MEMORY_STORAGE=false nest start --watch",
+    "start:mem": "USE_MEMORY_STORAGE=true nest start --watch"
   },
   "dependencies": {
     "@nestjs/common": "^10.3.0",

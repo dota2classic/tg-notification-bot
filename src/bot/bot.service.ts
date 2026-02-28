@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
 import { Telegraf, Markup } from 'telegraf';
 import { io, Socket } from 'socket.io-client';
-import { RedisService } from '../redis/redis.service';
+import { StorageService } from '../storage/storage.service';
 import { UserSettings, QueueState, OnlineStats, DEFAULT_SETTINGS } from './bot.types';
 
 const ADMIN_ID: number[] = [389569299, 366409812];
@@ -19,7 +19,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private config: ConfigService,
-    private redis: RedisService,
+    private storage: StorageService,
     @InjectPinoLogger(BotService.name) private readonly logger: PinoLogger,
   ) {
     this.bot = new Telegraf(this.config.getOrThrow('TG_KEY'));
@@ -60,7 +60,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         chatId,
       });
 
-      const settings = await this.redis.toggleSetting(chatId, type);
+      const settings = await this.storage.toggleSetting(chatId, type);
       if (settings) {
         await ctx.editMessageReplyMarkup(this.getKeyboard(settings).reply_markup);
         await ctx.answerCbQuery('Настройка сохранена');
@@ -125,7 +125,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async broadcast(text: string, type: keyof UserSettings) {
-    const users = await this.redis.getAllUsers();
+    const users = await this.storage.getAllUsers();
     const keyboard = Markup.inlineKeyboard([[Markup.button.url('🔗 Залететь в поиск', 'https://dotaclassic.ru')]]);
 
     let sent = 0;
@@ -149,7 +149,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       chatId: ctx.chat.id,
     });
 
-    const user = await this.redis.getOrCreateUser(ctx.chat.id, ctx.from.username || 'n/a');
+    const user = await this.storage.getOrCreateUser(ctx.chat.id, ctx.from.username || 'n/a');
     await ctx.reply('⚙️ *Настройки уведомлений*\nВыбери, какие уведомления хочешь получать:', {
       parse_mode: 'Markdown',
       ...this.getKeyboard(user.settings),

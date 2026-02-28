@@ -1,7 +1,7 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { LoggerModule } from 'nestjs-pino';
-import { RedisModule } from './redis/redis.module';
+import { StorageModule } from './storage/storage.module';
 import { BotModule } from './bot/bot.module';
 
 @Module({
@@ -16,7 +16,7 @@ import { BotModule } from './bot/bot.module';
         level: process.env.LOG_LEVEL || 'info',
       },
     }),
-    RedisModule,
+    StorageModule.forRoot(),
     BotModule,
   ],
 })

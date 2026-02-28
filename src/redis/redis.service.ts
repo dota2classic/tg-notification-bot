@@ -1,16 +1,19 @@
 import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createClient, RedisClientType } from 'redis';
+import { StorageService } from '../storage/storage.service';
 import { User, UserSettings, DEFAULT_SETTINGS } from '../bot/bot.types';
 
 const USERS_KEY = 'tg_bot:users';
 
 @Injectable()
-export class RedisService implements OnModuleInit, OnModuleDestroy {
+export class RedisService extends StorageService implements OnModuleInit, OnModuleDestroy {
   private client: RedisClientType;
   private readonly logger = new Logger(RedisService.name);
 
-  constructor(private config: ConfigService) {}
+  constructor(private config: ConfigService) {
+    super();
+  }
 
   async onModuleInit() {
     this.client = createClient({
