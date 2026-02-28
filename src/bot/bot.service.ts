@@ -199,7 +199,7 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
   private async broadcast(text: string, type: keyof UserSettings): Promise<{ sent: number; failed: number }> {
     const users = await this.storage.getAllUsers();
-    const keyboard = Markup.inlineKeyboard([[Markup.button.url('🔗 Залететь в поиск', 'https://dotaclassic.ru')]]);
+    const keyboard = Markup.inlineKeyboard([[Markup.button.url('🔗 Залететь в поиск', 'https://dotaclassic.ru/queue')]]);
 
     let sent = 0;
     let failed = 0;
