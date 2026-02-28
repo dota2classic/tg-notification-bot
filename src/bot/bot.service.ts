@@ -1,12 +1,15 @@
 import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
-import { Telegraf, Markup } from 'telegraf';
+import { Telegraf, Markup, Context } from 'telegraf';
+import { Message, Update } from 'telegraf/types';
 import { io, Socket } from 'socket.io-client';
 import { StorageService } from '../storage/storage.service';
 import { UserSettings, QueueState, OnlineStats, DEFAULT_SETTINGS } from './bot.types';
 
-const ADMIN_ID: number[] = [389569299, 366409812];
+type TextContext = Context<Update.MessageUpdate<Message.TextMessage>>;
+
+const ADMIN_IDS = [389569299, 366409812];
 const SOCKET_URL = 'https://api.dotaclassic.ru';
 
 @Injectable()
@@ -16,6 +19,9 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
 
   private queues: Record<number, number> = { 1: 0, 8: 0 };
   private lastPushCount: Record<number, number> = { 1: 0, 8: 0 };
+
+  private readonly queueNotifyThresholds = [8, 9];
+  private readonly queueResetThreshold = 5;
 
   constructor(
     private config: ConfigService,
@@ -50,7 +56,10 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
     this.bot.action(/toggle_(normal|highroom|manual)/, async (ctx) => {
       const type = ctx.match[1] as keyof UserSettings;
       const chatId = ctx.chat?.id;
-      if (!chatId) return;
+      if (!chatId) {
+        this.logger.warn({ event: 'action_no_chat', action: `toggle_${type}` });
+        return;
+      }
 
       this.logger.info({
         event: 'action',
@@ -60,14 +69,22 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
         chatId,
       });
 
-      const settings = await this.storage.toggleSetting(chatId, type);
-      if (settings) {
-        await ctx.editMessageReplyMarkup(this.getKeyboard(settings).reply_markup);
-        await ctx.answerCbQuery('Настройка сохранена');
+      try {
+        const settings = await this.storage.toggleSetting(chatId, type);
+        if (settings) {
+          await ctx.editMessageReplyMarkup(this.getKeyboard(settings).reply_markup);
+          await ctx.answerCbQuery('Настройка сохранена');
+        } else {
+          this.logger.warn({ event: 'toggle_no_user', chatId, type });
+          await ctx.answerCbQuery('Ошибка: пользователь не найден');
+        }
+      } catch (err) {
+        this.logger.error({ event: 'toggle_error', chatId, type, error: err });
+        await ctx.answerCbQuery('Произошла ошибка').catch(() => {});
       }
     });
 
-    this.bot.on('text', async (ctx) => {
+    this.bot.on('text', async (ctx: TextContext) => {
       const text = ctx.message.text;
 
       this.logger.info({
@@ -79,81 +96,156 @@ export class BotService implements OnModuleInit, OnModuleDestroy {
       });
 
       const lowerText = text.toLowerCase();
-      if ((lowerText === 'го' || lowerText === '/го') && ADMIN_ID.includes(ctx.from.id)) {
-        try {
-          const res = await fetch(`${SOCKET_URL}/v1/stats/online`);
-          const data = (await res.json()) as OnlineStats;
-          const msg = [
-            `🚀 *DotaClassic: Пора заходить!*`,
-            `👤 Играет: ${data.inGame || 0}`,
-            `⚔️ Обычная: ${this.queues[1] || 0}`,
-            `🏆 Highroom: ${this.queues[8] || 0}`,
-          ].join('\n');
-          await this.broadcast(msg, 'manual');
-          await ctx.reply('✅ Рассылка выполнена.');
-
-          this.logger.info({ event: 'broadcast', type: 'manual', triggeredBy: ctx.from.id });
-        } catch (err) {
-          this.logger.error({ event: 'broadcast_error', error: err });
-          await ctx.reply('Ошибка API.');
-        }
+      if ((lowerText === 'го' || lowerText === '/го') && ADMIN_IDS.includes(ctx.from.id)) {
+        await this.handleManualBroadcast(ctx);
       }
     });
   }
 
+  private async handleManualBroadcast(ctx: TextContext) {
+    try {
+      const res = await fetch(`${SOCKET_URL}/v1/stats/online`);
+      if (!res.ok) {
+        this.logger.error({ event: 'api_error', status: res.status, statusText: res.statusText });
+        await ctx.reply('Ошибка API: сервер недоступен.');
+        return;
+      }
+
+      const data = (await res.json()) as OnlineStats;
+      const msg = [
+        `🚀 *DotaClassic: Пора заходить!*`,
+        `👤 Играет: ${data.inGame || 0}`,
+        `⚔️ Обычная: ${this.queues[1] || 0}`,
+        `🏆 Highroom: ${this.queues[8] || 0}`,
+      ].join('\n');
+
+      const result = await this.broadcast(msg, 'manual');
+      await ctx.reply(`✅ Рассылка выполнена. Отправлено: ${result.sent}, ошибок: ${result.failed}`);
+
+      this.logger.info({ event: 'broadcast', type: 'manual', triggeredBy: ctx.from.id, ...result });
+    } catch (err) {
+      this.logger.error({ event: 'broadcast_error', error: err });
+      await ctx.reply('Ошибка при выполнении рассылки.');
+    }
+  }
+
   private setupSocket() {
-    this.socket = io(SOCKET_URL, { transports: ['websocket'], path: '/socket.io' });
+    this.socket = io(SOCKET_URL, {
+      transports: ['websocket'],
+      path: '/socket.io',
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 30000,
+    });
+
+    this.socket.on('connect', () => {
+      this.logger.info({ event: 'socket_connected', url: SOCKET_URL });
+    });
+
+    this.socket.on('disconnect', (reason) => {
+      this.logger.warn({ event: 'socket_disconnected', reason });
+    });
+
+    this.socket.on('connect_error', (err) => {
+      this.logger.error({ event: 'socket_connect_error', error: err.message });
+    });
+
+    this.socket.on('reconnect', (attempt) => {
+      this.logger.info({ event: 'socket_reconnected', attempt });
+    });
+
+    this.socket.on('reconnect_attempt', (attempt) => {
+      this.logger.debug({ event: 'socket_reconnect_attempt', attempt });
+    });
 
     this.socket.on('QUEUE_STATE', async (msg: QueueState) => {
-      if (msg?.mode === undefined) return;
+      if (msg?.mode === undefined) {
+        this.logger.debug({ event: 'queue_state_invalid', msg });
+        return;
+      }
 
       const { mode, inQueue: count } = msg;
       const prev = this.queues[mode] || 0;
       this.queues[mode] = count;
 
-      if ((count === 8 || count === 9) && count > prev && this.lastPushCount[mode] !== count) {
+      const shouldNotify =
+        this.queueNotifyThresholds.includes(count) && count > prev && this.lastPushCount[mode] !== count;
+
+      if (shouldNotify) {
         this.lastPushCount[mode] = count;
         const type: keyof UserSettings = mode === 1 ? 'normal' : 'highroom';
         const name = mode === 1 ? 'Обычная 5х5' : 'Highroom 5x5';
-        await this.broadcast(`🔥 *Почти собрались!* \nВ поиске (${name}) уже *${count}/10* игроков.`, type);
+        const result = await this.broadcast(`🔥 *Почти собрались!* \nВ поиске (${name}) уже *${count}/10* игроков.`, type);
 
-        this.logger.info({ event: 'broadcast', type, mode, count });
+        this.logger.info({ event: 'broadcast', type, mode, count, ...result });
       }
 
-      if (count < 5) this.lastPushCount[mode] = 0;
+      if (count < this.queueResetThreshold) {
+        this.lastPushCount[mode] = 0;
+      }
     });
   }
 
-  private async broadcast(text: string, type: keyof UserSettings) {
+  private async broadcast(text: string, type: keyof UserSettings): Promise<{ sent: number; failed: number }> {
     const users = await this.storage.getAllUsers();
     const keyboard = Markup.inlineKeyboard([[Markup.button.url('🔗 Залететь в поиск', 'https://dotaclassic.ru')]]);
 
     let sent = 0;
-    for (const [id, user] of Object.entries(users)) {
-      const settings = user.settings || DEFAULT_SETTINGS;
-      if (settings[type]) {
-        this.bot.telegram.sendMessage(id, text, { parse_mode: 'Markdown', ...keyboard }).catch(() => {});
-        sent++;
-      }
-    }
+    let failed = 0;
 
-    this.logger.info({ event: 'broadcast_complete', type, recipients: sent });
+    const sendPromises = Object.entries(users).map(async ([id, user]) => {
+      const settings = user.settings || DEFAULT_SETTINGS;
+      if (!settings[type]) return;
+
+      try {
+        await this.bot.telegram.sendMessage(id, text, { parse_mode: 'Markdown', ...keyboard });
+        sent++;
+      } catch (err) {
+        failed++;
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        if (errorMessage.includes('blocked') || errorMessage.includes('deactivated')) {
+          this.logger.debug({ event: 'broadcast_user_unavailable', userId: id, reason: errorMessage });
+        } else {
+          this.logger.warn({ event: 'broadcast_send_error', userId: id, error: errorMessage });
+        }
+      }
+    });
+
+    await Promise.all(sendPromises);
+
+    this.logger.info({ event: 'broadcast_complete', type, sent, failed, total: Object.keys(users).length });
+    return { sent, failed };
   }
 
-  private async handleNotifications(ctx: { chat: { id: number }; from: { id: number; username?: string }; reply: Function }, command: string) {
+  private async handleNotifications(ctx: Context, command: string) {
+    const chatId = ctx.chat?.id;
+    const fromId = ctx.from?.id;
+    const username = ctx.from?.username;
+
+    if (!chatId || !fromId) {
+      this.logger.warn({ event: 'command_no_context', command });
+      return;
+    }
+
     this.logger.info({
       event: 'command',
       command,
-      userId: ctx.from.id,
-      username: ctx.from.username,
-      chatId: ctx.chat.id,
+      userId: fromId,
+      username,
+      chatId,
     });
 
-    const user = await this.storage.getOrCreateUser(ctx.chat.id, ctx.from.username || 'n/a');
-    await ctx.reply('⚙️ *Настройки уведомлений*\nВыбери, какие уведомления хочешь получать:', {
-      parse_mode: 'Markdown',
-      ...this.getKeyboard(user.settings),
-    });
+    try {
+      const user = await this.storage.getOrCreateUser(chatId, username || 'n/a');
+      await ctx.reply('⚙️ *Настройки уведомлений*\nВыбери, какие уведомления хочешь получать:', {
+        parse_mode: 'Markdown',
+        ...this.getKeyboard(user.settings),
+      });
+    } catch (err) {
+      this.logger.error({ event: 'command_error', command, chatId, error: err });
+      await ctx.reply('Произошла ошибка. Попробуйте позже.').catch(() => {});
+    }
   }
 
   private getKeyboard(settings?: UserSettings) {

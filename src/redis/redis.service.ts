@@ -2,40 +2,47 @@ import { Injectable, OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/commo
 import { ConfigService } from '@nestjs/config';
 import { createClient, RedisClientType } from 'redis';
 import { StorageService } from '../storage/storage.service';
-import { User, UserSettings, DEFAULT_SETTINGS } from '../bot/bot.types';
+import { User } from '../bot/bot.types';
 
 const USERS_KEY = 'tg_bot:users';
 
 @Injectable()
 export class RedisService extends StorageService implements OnModuleInit, OnModuleDestroy {
   private client: RedisClientType;
-  private readonly logger = new Logger(RedisService.name);
+  protected readonly logger = new Logger(RedisService.name);
 
   constructor(private config: ConfigService) {
     super();
   }
 
   async onModuleInit() {
+    const host = this.config.get('REDIS_HOST', 'localhost');
+    const port = this.config.get('REDIS_PORT', 6379);
+
     this.client = createClient({
-      socket: {
-        host: this.config.get('REDIS_HOST', 'localhost'),
-        port: 6379,
-      },
+      socket: { host, port },
       password: this.config.get('REDIS_PASSWORD'),
     });
 
-    this.client.on('error', (err) => this.logger.error('Redis error', err));
+    this.client.on('error', (err) => this.logger.error('Redis client error', err));
     await this.client.connect();
-    this.logger.log('Connected to Redis');
+    this.logger.log(`Connected to Redis at ${host}:${port}`);
   }
 
   async onModuleDestroy() {
     await this.client.quit();
+    this.logger.log('Disconnected from Redis');
   }
 
   async getUser(chatId: string | number): Promise<User | null> {
     const data = await this.client.hGet(USERS_KEY, String(chatId));
-    return data ? JSON.parse(data) : null;
+    if (!data) return null;
+
+    const user = this.safeJsonParse<User>(data);
+    if (!user) {
+      this.logger.warn(`Corrupted user data for chatId=${chatId}, returning null`);
+    }
+    return user;
   }
 
   async setUser(chatId: string | number, user: User): Promise<void> {
@@ -45,31 +52,21 @@ export class RedisService extends StorageService implements OnModuleInit, OnModu
   async getAllUsers(): Promise<Record<string, User>> {
     const data = await this.client.hGetAll(USERS_KEY);
     const users: Record<string, User> = {};
+    let parseErrors = 0;
+
     for (const [id, json] of Object.entries(data)) {
-      users[id] = JSON.parse(json);
+      const user = this.safeJsonParse<User>(json);
+      if (user) {
+        users[id] = user;
+      } else {
+        parseErrors++;
+      }
     }
+
+    if (parseErrors > 0) {
+      this.logger.warn(`Skipped ${parseErrors} users due to JSON parse errors`);
+    }
+
     return users;
-  }
-
-  async getOrCreateUser(chatId: string | number, username: string): Promise<User> {
-    let user = await this.getUser(chatId);
-    if (!user) {
-      user = { username, settings: { ...DEFAULT_SETTINGS } };
-      await this.setUser(chatId, user);
-    } else if (!user.settings) {
-      user.settings = { ...DEFAULT_SETTINGS };
-      await this.setUser(chatId, user);
-    }
-    return user;
-  }
-
-  async toggleSetting(chatId: string | number, key: keyof UserSettings): Promise<UserSettings | null> {
-    const user = await this.getUser(chatId);
-    if (!user) return null;
-
-    user.settings = user.settings || { ...DEFAULT_SETTINGS };
-    user.settings[key] = !user.settings[key];
-    await this.setUser(chatId, user);
-    return user.settings;
   }
 }

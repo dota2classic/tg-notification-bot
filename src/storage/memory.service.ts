@@ -1,11 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { StorageService } from './storage.service';
-import { User, UserSettings, DEFAULT_SETTINGS } from '../bot/bot.types';
+import { User } from '../bot/bot.types';
 
 @Injectable()
 export class MemoryStorageService extends StorageService {
   private readonly users = new Map<string, User>();
-  private readonly logger = new Logger(MemoryStorageService.name);
+  protected readonly logger = new Logger(MemoryStorageService.name);
 
   constructor() {
     super();
@@ -26,27 +26,5 @@ export class MemoryStorageService extends StorageService {
       result[id] = user;
     }
     return result;
-  }
-
-  async getOrCreateUser(chatId: string | number, username: string): Promise<User> {
-    let user = await this.getUser(chatId);
-    if (!user) {
-      user = { username, settings: { ...DEFAULT_SETTINGS } };
-      await this.setUser(chatId, user);
-    } else if (!user.settings) {
-      user.settings = { ...DEFAULT_SETTINGS };
-      await this.setUser(chatId, user);
-    }
-    return user;
-  }
-
-  async toggleSetting(chatId: string | number, key: keyof UserSettings): Promise<UserSettings | null> {
-    const user = await this.getUser(chatId);
-    if (!user) return null;
-
-    user.settings = user.settings || { ...DEFAULT_SETTINGS };
-    user.settings[key] = !user.settings[key];
-    await this.setUser(chatId, user);
-    return user.settings;
   }
 }
